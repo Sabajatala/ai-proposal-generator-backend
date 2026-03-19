@@ -384,93 +384,199 @@ exports.regenerateProposal = async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 };
-
 exports.generatePdf = async (req, res) => {
   try {
     const { id } = req.params;
-    const { version } = req.query; // ?version=latest (default) or ?version=2
+    const { version = 'latest' } = req.query;
 
     const proposal = await Proposal.findById(id).populate('company');
     if (!proposal) {
       return res.status(404).json({ success: false, error: 'Proposal not found' });
     }
 
-    // Choose content based on version
     let selectedContent = proposal.aiContent;
-    let versionInfo = 'Latest version';
-    if (version && version !== 'latest') {
+    let versionNumber = 'latest';
+    let isLatest = true;
+
+    if (version !== 'latest') {
       const selVer = proposal.versions.find(v => v.versionNumber === Number(version));
       if (!selVer) {
-        return res.status(404).json({ success: false, error: 'Selected version not found' });
+        return res.status(404).json({ success: false, error: 'Version not found' });
       }
       selectedContent = selVer.aiContent;
-      versionInfo = `Version ${version}`;
+      versionNumber = selVer.versionNumber;
+      isLatest = false;
     }
 
-    // Optional: skip if PDF already exists for this version (uncomment if you want)
-    // if (proposal.pdfUrl) {
-    //   return res.json({
-    //     success: true,
-    //     message: `PDF already generated for ${versionInfo}`,
-    //     pdfUrl: proposal.pdfUrl
-    //   });
-    // }
+    // Optional: return existing PDF if already generated
+    if (isLatest && proposal.pdfUrl) {
+      return res.json({
+        success: true,
+        pdfUrl: proposal.pdfUrl,
+        message: 'Using existing PDF (latest)',
+        version: 'latest'
+      });
+    }
+    if (!isLatest) {
+      const existingVer = proposal.versions.find(v => v.versionNumber === Number(version));
+      if (existingVer?.pdfUrl) {
+        return res.json({
+          success: true,
+          pdfUrl: existingVer.pdfUrl,
+          message: `Using existing PDF (v${version})`,
+          version
+        });
+      }
+    }
 
-    // Prepare content for PDF (use selected version's aiContent)
+    // Prepare content
     const pdfContent = {
       ...proposal.toObject(),
-      aiContent: selectedContent
+      aiContent: selectedContent,
+      versionLabel: isLatest ? 'Latest' : `Version ${versionNumber}`
     };
 
-    // Generate & upload
     const pdfUrl = await generateAndUploadPdf(pdfContent);
 
-    // Save to DB (overwrite current pdfUrl – or extend to per-version if needed)
-    proposal.pdfUrl = pdfUrl;
+    // Save to correct place
+    if (isLatest) {
+      proposal.pdfUrl = pdfUrl;
+    } else {
+      const verIndex = proposal.versions.findIndex(v => v.versionNumber === Number(version));
+      if (verIndex !== -1) {
+        proposal.versions[verIndex].pdfUrl = pdfUrl;
+      }
+    }
+
     await proposal.save();
 
     res.json({
       success: true,
-      message: `PDF generated successfully for ${versionInfo}`,
       pdfUrl,
-      version: version || 'latest'
+      message: `PDF generated for ${isLatest ? 'latest version' : `version ${version}`}`,
+      version: isLatest ? 'latest' : version
     });
+
   } catch (err) {
     console.error('PDF generation error:', err);
     res.status(500).json({ success: false, error: err.message || 'Failed to generate PDF' });
   }
 };
 
+// exports.updateProposal = async (req, res) => {
+//   try {
+//     const proposal = await Proposal.findById(req.params.id);
+
+//     if (!proposal) {
+//       return res.status(404).json({ success: false, error: 'Proposal not found' });
+//     }
+
+  
+//     if (proposal.status !== 'Draft') {
+//       return res.status(403).json({ success: false, error: 'Can only update Draft proposals' });
+//     }
+
+    
+//     const allowedUpdates = ['title', 'clientName', 'clientEmail', 'clientIndustry', 'projectType', 'budget', 'requirements'];
+//     allowedUpdates.forEach(field => {
+//       if (req.body[field] !== undefined) {
+//         proposal[field] = req.body[field];
+//       }
+//     });
+
+//     await proposal.save();
+
+//     res.json({
+//       success: true,
+//       message: 'Proposal updated successfully',
+//       data: proposal
+//     });
+//   } catch (err) {
+//     res.status(500).json({ success: false, error: err.message });
+//   }
+// };
+
 exports.updateProposal = async (req, res) => {
   try {
     const proposal = await Proposal.findById(req.params.id);
-
     if (!proposal) {
-      return res.status(404).json({ success: false, error: 'Proposal not found' });
+      return res.status(404).json({
+        success: false,
+        error: 'Proposal not found'
+      });
     }
 
-  
     if (proposal.status !== 'Draft') {
-      return res.status(403).json({ success: false, error: 'Can only update Draft proposals' });
+      return res.status(403).json({
+        success: false,
+        error: 'Can only edit proposals in Draft status'
+      });
     }
 
-    
-    const allowedUpdates = ['title', 'clientName', 'clientEmail', 'clientIndustry', 'projectType', 'budget', 'requirements'];
-    allowedUpdates.forEach(field => {
+    let shouldCreateNewVersion = false;
+
+    // 1. Update basic fields 
+    const updatableFields = [
+      'title',
+      'clientName',
+      'clientEmail',
+      'clientIndustry',
+      'projectType',
+      'budget',
+      'requirements',
+      'paymentTerms'
+    ];
+
+    updatableFields.forEach(field => {
       if (req.body[field] !== undefined) {
+        if (proposal[field] !== req.body[field]) {
+          shouldCreateNewVersion = true;
+        }
         proposal[field] = req.body[field];
       }
     });
 
+    // 2. Handle aiContent update (merge style - safest & most common)
+    if (req.body.aiContent && typeof req.body.aiContent === 'object') {
+      shouldCreateNewVersion = true;
+
+      
+      proposal.aiContent = {
+        ...proposal.aiContent,
+        ...req.body.aiContent
+      };
+    }
+
+    
+    // Create new version if anything important changed
+    
+    if (shouldCreateNewVersion) {
+      const newVersionNumber = (proposal.versions?.length || 0) + 1;
+
+      proposal.versions.push({
+        versionNumber: newVersionNumber,
+        aiContent: { ...proposal.aiContent }, 
+        createdAt: new Date(),
+        
+      });
+    }
+
     await proposal.save();
 
-    res.json({
+    res.status(200).json({
       success: true,
-      message: 'Proposal updated successfully',
+      message: shouldCreateNewVersion
+        ? `Proposal updated — new version ${proposal.versions.length} created`
+        : 'Proposal updated successfully',
       data: proposal
     });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+
+  } catch (error) {
+    console.error('updateProposal error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error while updating proposal'
+    });
   }
 };
 

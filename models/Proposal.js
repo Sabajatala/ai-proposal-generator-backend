@@ -68,7 +68,8 @@ const proposalSchema = new mongoose.Schema({
   chatHistory: [{
     message: String,
     isAdmin: Boolean,
-    createdAt: Date
+    createdAt: Date,
+    pdfUrl:{ type: String, default: '' }
   }]
 }, {
   timestamps: true
